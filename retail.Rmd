@@ -1,0 +1,303 @@
+---
+title: "Retail Project"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Code Setup
+```{r, results = 'hide', message=FALSE}
+library(fpp3)
+library(readabs)
+library(tsibble)
+library(tseries)
+
+
+set.seed(28768671)
+myseries <- aus_retail %>%
+  filter(
+    `Series ID` == sample(aus_retail$`Series ID`,1),
+    Month < yearmonth("2018 Jan")
+  )
+
+
+train <- myseries %>% 
+  filter(Month <= max(Month)-24)
+
+
+train %>% autoplot(Turnover)+
+  ggtitle("Monthly Clothing Retail Turnover in New South Wales") +
+  ylab("Turnover (Million AUD)")+
+  xlab("Year (Monthly Data point)")
+```
+
+By examining the data, there are several features that I need to take into account when modelling. First is a strong presence heteroskedasticity where variation in the data when turnover is low is much less than  the variation with turnover is high. This can be adjusted with a Box-Cox transformation. Other features include a clear trend that seems to be dampening towards the end and clear seassonaility. 
+
+
+```{r}
+lambda = train %>% features(Turnover, features = guerrero)
+lambda$lambda_guerrero
+
+myseries %>% autoplot(box_cox(Turnover, lambda$lambda_guerrero)) +
+  ggtitle("Box-Cox Adjusted Monthly Turnover")+
+  xlab("Year (Monthly Data point)")+
+  ylab("Adjusted Turnover")
+
+```
+
+The heteroskedasticity seems to be taken care of and the variance is now stablised. 
+
+## ETS
+### Model Selection
+When choosing an ETS model, the model should include all level, trend and seasonality as the data contains these components. As the data is strictly positive, both additive and multiplicative errors can be used. For the trend component, both additive and additive damped can be tested as the data does display dampening towards the end. For seasonality, both additive and multiplicative can be tested, however, the combination of additive error and multiplicative seasonality should be avoided as they can be unstable. 
+
+Here I attempted all the available models:
+
+```{r}
+ets_fit<- train %>% model(
+  auto = ETS(box_cox(Turnover, -0.03429885)),
+  AAA = ETS(box_cox(Turnover, -0.03429885) ~ error("A") + trend("A") + season("A")),
+  AAdA = ETS(box_cox(Turnover, -0.03429885) ~ error("A") + trend("Ad") + season("A")),
+  MAA = ETS(box_cox(Turnover, -0.03429885) ~ error("M") + trend("A") + season("A")),
+  MAdA = ETS(box_cox(Turnover, -0.03429885) ~ error("M") + trend("Ad") + season("A")),
+  MAM = ETS(box_cox(Turnover, -0.03429885) ~ error("M") + trend("A") + season("M")),
+  MAdM = ETS(box_cox(Turnover, -0.03429885) ~ error("M") + trend("Ad") + season("M"))
+  )
+select(glance(ets_fit), -State, - Industry)
+```
+The ETS function as chosen a model has automatically chosen the model with lowest AICc value, which is the AAA. However, the dampened AAdA model is closely behind and it would be possible for a dampened model can product a better forecast, therefore they are both included in the subsequent analysis.
+
+
+### Forecasting
+
+```{r}
+ets_aaa <- train %>% model(ETS(box_cox(Turnover, -0.03429885) ~ error("A") + trend("A") + season("A")))
+ets_aada <- train %>% model(ETS(box_cox(Turnover, -0.03429885) ~ error("A") + trend("Ad") + season("A")))
+ets_aaa_fc <- ets_aaa %>% forecast(h =24)
+ets_aada_fc <- ets_aada %>% forecast(h =24)
+
+```
+
+#### ETS(A,A,A) Model
+```{r}
+
+ets_aaa_fc %>% accuracy(myseries)
+ets_aaa_fc %>% autoplot(myseries %>% 
+                      filter(Month >= max(Month)-120)) +
+  ggtitle("Monthly Clothing Retail Turnover in New South Wales Forecast (ETS A,A,A)") +
+  ylab("Turnover (Million AUD)")+
+  xlab("Year (Monthly Data point)")
+```
+
+#### ETS(A,Ad,A) Model
+```{r}
+ets_aada_fc %>% accuracy(myseries)
+ets_aada_fc %>% autoplot(myseries %>% 
+                      filter(Month >= max(Month)-120)) +
+  ggtitle("Monthly Clothing Retail Turnover in New South Wales Forecast (ETS A,Ad,A)") +
+  ylab("Turnover (Million AUD)")+
+  xlab("Year (Monthly Data point)")
+
+
+```
+
+Both of the models was able to produce decent and similar forecastes. The model was able to predict the seasonality and the upward trend, most of the actual Turnover level is also within the 80% interval. Between the two models, the ETS(A,A,A) model achieved lower MASE and considering the lower AICc value for fitting the entire dataset, it was chosen to be the best ETS model.
+
+
+
+#### Estimated Parameters for ETS(A,A,A) Model
+```{r}
+report(ets_aaa)
+```
+
+### Residual Diagnostics 
+```{r}
+gg_tsresiduals(ets_aaa)
+
+augment(ets_aaa) %>%
+  features(.resid, ljung_box, lag=24, dof=3)
+augment(ets_aaa)$.resid %>%
+  mean()
+augment(ets_aaa)$.resid %>%
+  jarque.bera.test()
+```
+
+The residuals of the model is not well behaved, although the residual series mostly resembles white noise, it also show signs of heteroskedasticity where variance at the start of the series is stronger than variance towards the end, this can result in inaccuract  prediction intervals. Possible solution is a reduction in strength of the Box-Cox transformation. 
+
+The ACF plot also shows autocorrelation in the lagged residuals, which is confirmed by a Ljung-Box test with p-value of 4.07e-8. This suggests that there are more available information in the residuals not captured by the model and the model could be improved. The distribution of the residuals is very close to 0, suggesting unbiasedness. The Jarque-Bera test with p-value of 3.494e-09 suggest that We have sufficient evidence to reject normality at 5% significance level, which will again impact our prediction intervals.
+
+## ARIMA
+### Model Selection
+
+The ARIMA method also uses the Box-Cox transformed training set so the variance is stable, then we find the appropiate differencing order to stablise the mean.
+```{r}
+train %>% autoplot(box_cox(Turnover, -0.03429885)) +
+  ggtitle("Box-Cox Adjusted Monthly Turnover")+
+  xlab("Year (Monthly Data point)")+
+  ylab("Adjusted Turnover")
+```
+
+As there are strong seasonality, the seasonal difference is checked first as it is possible that normal differencing is not required after seasonal differencing.
+
+```{r}
+train %>% features(box_cox(Turnover, -0.03429885), list(unitroot_nsdiffs, feat_stl))
+```
+
+Seasonal strength > 0.64, applying 1 seasonal difference 
+
+```{r}
+train %>% features(difference(box_cox(Turnover, -0.03429885),12) , unitroot_nsdiffs)
+```
+
+Applying 1 seasonal differencing was sufficient to stablise the seasonal component as the nsdiffs value is now 0. Then I checked if more differenceing is required for the non-seasonal component.
+
+
+```{r}
+train %>% features(difference(box_cox(Turnover, -0.03429885),12) , unitroot_kpss)
+```
+Seasonal differencing was sufficient to stablise the mean as suggested by the unit root test with p-value of 0.1. More differencing is not required. Next I try to determine which ARIMA model would be appropiate by examining the autocorrelation structure of the data.
+
+```{r}
+train %>% gg_tsdisplay(difference(box_cox(Turnover, -0.03429885), 12), plot_type='partial')
+```
+
+The ACF shows exponentially decaying lags which are significant until lag 10 while the PACF shows significant lags up to lag 4. This is a clear indication for an AR(4) model.
+
+For the seasonal component, there are significant lags at 12 and 24 for both the ACF and PACF, so both seasonal AR and seasonal MA will have to be tested.
+
+```{r}
+arima_fit <- train %>% model(
+  arima_400_011 = ARIMA(box_cox(Turnover, -0.03429885) ~ 1 + pdq(4,0,0)+ PDQ(0,1,1)),
+  arima_400_012 = ARIMA(box_cox(Turnover, -0.03429885) ~ 1 + pdq(4,0,0)+ PDQ(0,1,2)),
+  arima_400_110 = ARIMA(box_cox(Turnover, -0.03429885) ~ 1 + pdq(4,0,0)+ PDQ(1,1,0)),
+  arima_400_210 = ARIMA(box_cox(Turnover, -0.03429885) ~ 1 + pdq(4,0,0)+ PDQ(2,1,0)),
+  arima_400_111 = ARIMA(box_cox(Turnover, -0.03429885) ~ 1 + pdq(4,0,0)+ PDQ(1,1,1)),
+  arima_400_212 = ARIMA(box_cox(Turnover, -0.03429885) ~ 1 + pdq(4,0,0)+ PDQ(2,1,2)),
+)
+select(glance(arima_fit), -State, - Industry)
+```
+It seems the best performing model based on AICc is ARIMA(4,0,0)(0,1,2), the model space is explored further by altering the non-seasonal components.
+
+```{r}
+arima_fit <- train %>% model(
+  arima_400_012 = ARIMA(box_cox(Turnover, -0.03429885) ~ 1 + pdq(4,0,0)+ PDQ(0,1,2)),
+  arima_401_012 = ARIMA(box_cox(Turnover, -0.03429885) ~ 1 + pdq(4,0,1)+ PDQ(0,1,2)),
+  arima_402_012 = ARIMA(box_cox(Turnover, -0.03429885) ~ 1 + pdq(4,0,2)+ PDQ(0,1,2)),
+  arima_500_012 = ARIMA(box_cox(Turnover, -0.03429885) ~ 1 + pdq(5,0,0)+ PDQ(0,1,2)),
+  arima_501_012 = ARIMA(box_cox(Turnover, -0.03429885) ~ 1 + pdq(5,0,1)+ PDQ(0,1,2)),
+  arima_502_012 = ARIMA(box_cox(Turnover, -0.03429885) ~ 1 + pdq(5,0,2)+ PDQ(0,1,2)),
+  arima_300_012 = ARIMA(box_cox(Turnover, -0.03429885) ~ 1 + pdq(3,0,0)+ PDQ(0,1,2)),
+  arima_301_012 = ARIMA(box_cox(Turnover, -0.03429885) ~ 1 + pdq(3,0,1)+ PDQ(0,1,2)),
+  arima_302_012 = ARIMA(box_cox(Turnover, -0.03429885) ~ 1 + pdq(3,0,2)+ PDQ(0,1,2)),
+)
+
+select(glance(arima_fit), -State, - Industry)
+```
+
+Currently ARIMA(5,0,1)(0,1,2) is the best performing model based on AICc, an extended search with automatic ARIMA is performed to check if any better ARIMA
+model is available.
+
+```{r}
+
+auto_arima <- train %>% model(
+  ARIMA(box_cox(Turnover, -0.03429885),  stepwise = FALSE,
+               approximation = FALSE,
+               order_constraint = p + q + P + Q <= 9))
+
+auto_arima %>% report
+
+```
+The automatic ARIMA function found the best model to be ARIMA(5,0,1)(2,1,1), which has a slightly better AICc score. Although there is an increase in complexity of the model, the AICc score suggests it is justified by the increase in log likelihood. This model is selected to be the best ARIMA model. 
+
+
+```{r}
+arima_best <- train %>% model(
+  ARIMA(box_cox(Turnover, -0.03429885) ~ 1 + pdq(5,0,1)+ PDQ(2,1,1)))
+arima_fc <- arima_best %>% forecast(h =24)
+
+arima_fc %>% autoplot(myseries %>% 
+                           filter(Month >= max(Month)-120)) +
+  ggtitle("Monthly Turnover: ARIMA(5,0,1)(2,1,1)") +
+  ylab("Turnover (Million AUD)")+
+  xlab("Year (Monthly Data point)")
+arima_fc %>% accuracy(myseries)
+
+```
+
+
+The forecast also performed very well and is able to capture the increasing trend and seasonality in the test dataset. The test set are also within the 80% prediction interval. The MASE value is very low at 0.73, which is even lower than the best of ETS models. 
+
+#### Estimated Parameters for ARIMA(5,0,1)(2,1,1) Model
+```{r}
+report(arima_best)
+```
+
+
+### Residual Diagnostics 
+
+```{r}
+arima_best %>% gg_tsresiduals()
+
+augment(arima_best) %>%
+  features(.resid, ljung_box, lag=24, dof=10)
+```
+
+By examining the residual plot, the residuals seem to be well behaved, resembling white noise, centering at zero and having near constant volatility. The distribution of the residuals also seems normal. The ACF shows no significant lags, suggesting no auto correlation and all information in the lags is captured by the model. This is supported by the Ljung-Box test with p-value of 0.39.
+
+## Comparing ETS and ARIMA Forecasts
+While both models producted similar forecast and were both fairly accurate with low MASE, the ARIMA model was able to perform slightly better with lower MASE. The ARIMA model was also able to capture more information in the data as the residuals were not correlated. 
+
+## Out of Sample Forecasts
+Creating the forecasts: 
+```{r}
+ets_fit <- myseries %>% model(ETS(box_cox(Turnover, -0.03429885) ~ error("A") + trend("A") + season("A")))
+ets_fc <- ets_fit %>% forecast(h =24)
+
+
+arima_fit <- myseries %>% model(
+  ARIMA(box_cox(Turnover, -0.03429885) ~ 1 + pdq(5,0,1)+ PDQ(2,1,1)))
+arima_fc <- arima_fit %>% forecast(h =24)
+```
+
+Obtaining the out of sample data:
+```{r, results = 'hide', message=FALSE}
+retail_data = read_abs(8501.0, tables = 11)
+retail_ts <- retail_data %>% 
+  filter(series_id == "A3349399C") %>% 
+  add_column(State = "New South Wales", Industry = "Clothing retailing") %>%
+  mutate(Month = yearmonth(date), Turnover = value) %>%
+  select(-table_no, -sheet_no, -table_title, -series, -date, -value) %>% 
+  as_tsibble(key = c(State, Industry), index = Month)
+```
+
+Comparing the forecasts:
+
+ETS:
+```{r}
+ets_fc %>% autoplot(retail_ts %>% 
+  filter(Month >= max(Month)-60)) +
+  ggtitle("Monthly Clothing Retail Turnover in New South Wales Forecast: ETS(A,A,A)") +
+  ylab("Turnover (Million AUD)")+
+  xlab("Year (Monthly Data point)")
+ets_fc %>% accuracy(retail_ts)
+```
+
+
+ARIMA:
+```{r}
+arima_fc %>% autoplot(retail_ts %>% 
+  filter(Month >= max(Month)-60)) +
+  ggtitle("Monthly Clothing Retail Turnover in New South Wales Forecast: ARIMA") +
+  ylab("Turnover (Million AUD)")+
+  xlab("Year (Monthly Data point)")
+arima_fc %>% accuracy(retail_ts)
+```
+
+Both models produced similar forecasts as they were trained on the same data set. They both predicted well the turnover in 2018 and over predicted in 2019 where the seasonal pattern was still similar to previous years yet the increasing trend in overall turnover was dampening. Both predictions were still relatively accurate with the actual values mostly lying within the 80% prediction interval. The ARIMA model performed slightly better with MASE of 1.49 compared to  ETS model having a MASE of 1.66. 
+
+## Conclusions
+Overall, the ARIMA models were able to perform better in modeling the data and forecasting. The ARIMA model can be more adaptable, with infinite possible variations in regressors to handle the patterns and autocorrelations in the data, where as the ETS models are more limited in customisability with the set of possible models. However, the ARIMA models require much more computation and larger samples. The differencing and seasonal differencing required to achieve stationarity can consume a large portion of the sample data. The large model space also means more computation and experimenting is required to find the appropiate model, while the ETS method can simply test all possible models and find the best variation easily. 
+
+Both models are limited in that they rely only on information present in past data, they cannot predict variations caused by events outside the past data. A clear example would be the subsequent drop in turnover in 2020 resulted from COVID-19. The models will also have trouble predicting the turnover in 2021 as the estimated parameters derived from past data may bot be representative of the patterns in the future.
